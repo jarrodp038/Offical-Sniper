@@ -65,7 +65,7 @@ export class PriceFeed {
       const quoteAmount = parseFloat(new TokenAmount(quoteToken, sampleAmount).toFixed());
       return quoteAmount / baseAmount;
     } catch (e: any) {
-      logger.debug({ error: e.message }, 'samplePrice failed');
+      logger.warn({ error: e.message, mint: poolKeys.baseMint.toBase58() }, 'samplePrice failed');
       return 0;
     }
   }

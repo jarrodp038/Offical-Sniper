@@ -165,7 +165,7 @@ export class PatternTrader {
     );
 
     if (price <= 0) {
-      logger.debug({ mint: token.mintKey }, 'Price sample returned 0, skipping');
+      logger.warn({ mint: token.mintKey, symbol: token.info.symbol }, 'Price sample returned 0, skipping');
       return;
     }
 
