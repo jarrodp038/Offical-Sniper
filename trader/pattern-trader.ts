@@ -1,0 +1,428 @@
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  ComputeBudgetProgram,
+  TransactionMessage,
+  VersionedTransaction,
+} from '@solana/web3.js';
+import {
+  Liquidity,
+  LiquidityPoolKeysV4,
+  Token,
+  TokenAmount,
+  TOKEN_PROGRAM_ID,
+  SPL_ACCOUNT_LAYOUT,
+} from '@raydium-io/raydium-sdk';
+import {
+  getAssociatedTokenAddress,
+  createAssociatedTokenAccountIdempotentInstruction,
+} from '@solana/spl-token';
+import BN from 'bn.js';
+import { logger } from '../helpers/logger';
+import { findPoolForToken, PoolMatch } from '../helpers/pool-finder';
+import { fetchTokenInfo, TokenInfo } from '../analysis/token-info';
+import { PriceFeed } from '../analysis/price-feed';
+import { generateSignal, SignalConfig, DEFAULT_SIGNAL_CONFIG, Signal } from '../analysis/signal-engine';
+import { Position, PositionRiskConfig } from './position';
+import { TransactionExecutor } from '../transactions/transaction-executor.interface';
+
+export interface PatternTraderConfig {
+  wallet: Keypair;
+  quoteToken: Token;
+  quoteMint: PublicKey;
+  quoteAta: PublicKey;
+  quoteAmountPerPosition: BN;
+  tradingTokens: PublicKey[];
+  analysisIntervalMs: number;
+  maxConcurrentPositions: number;
+  computeUnitLimit: number;
+  computeUnitPrice: number;
+  maxBuyRetries: number;
+  maxSellRetries: number;
+  buySlippage: number;
+  sellSlippage: number;
+  signalConfig: SignalConfig;
+  riskConfig: PositionRiskConfig;
+}
+
+interface TrackedToken {
+  mint: PublicKey;
+  mintKey: string;
+  poolMatch: PoolMatch;
+  info: TokenInfo;
+  position?: Position;
+  inFlight: boolean;
+}
+
+export class PatternTrader {
+  private tracked: Map<string, TrackedToken> = new Map();
+  private running: boolean = false;
+  private analysisTimer: ReturnType<typeof setInterval> | undefined;
+
+  constructor(
+    private readonly connection: Connection,
+    private readonly txExecutor: TransactionExecutor,
+    private readonly priceFeed: PriceFeed,
+    private readonly config: PatternTraderConfig,
+  ) {}
+
+  async start(): Promise<void> {
+    if (this.running) return;
+    this.running = true;
+
+    logger.info(
+      { tokens: this.config.tradingTokens.map((t) => t.toBase58()) },
+      'Initializing pattern trader',
+    );
+
+    // Resolve pool + metadata for each target token
+    for (const mint of this.config.tradingTokens) {
+      const mintKey = mint.toBase58();
+      logger.info({ mint: mintKey }, 'Resolving pool and metadata...');
+
+      const poolMatch = await findPoolForToken(this.connection, mint, this.config.quoteMint);
+      if (!poolMatch) {
+        logger.error({ mint: mintKey }, 'Skipping token — no Raydium pool found');
+        continue;
+      }
+
+      const info = await fetchTokenInfo(this.connection, mint);
+
+      logger.info(
+        {
+          mint: mintKey,
+          name: info.name,
+          symbol: info.symbol,
+          decimals: info.decimals,
+          renounced: info.mintAuthorityRenounced,
+          freezable: !info.freezeAuthorityRenounced,
+          topHolderPct: info.topHolderPercent,
+        },
+        'Token loaded',
+      );
+
+      this.tracked.set(mintKey, {
+        mint,
+        mintKey,
+        poolMatch,
+        info,
+        inFlight: false,
+      });
+    }
+
+    if (this.tracked.size === 0) {
+      throw new Error('No tradable tokens — all pool lookups failed.');
+    }
+
+    logger.info(
+      { count: this.tracked.size, interval: this.config.analysisIntervalMs },
+      'Pattern trader ready — starting analysis loop',
+    );
+
+    // Kick off the analysis loop
+    this.analysisTimer = setInterval(() => {
+      this.runCycle().catch((e) => {
+        logger.error({ error: e.message }, 'Analysis cycle error');
+      });
+    }, this.config.analysisIntervalMs);
+
+    // Run once immediately
+    void this.runCycle();
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    if (this.analysisTimer) {
+      clearInterval(this.analysisTimer);
+      this.analysisTimer = undefined;
+    }
+    logger.info('Pattern trader stopped');
+  }
+
+  private async runCycle(): Promise<void> {
+    // Process all tracked tokens concurrently
+    const tasks = Array.from(this.tracked.values()).map((token) =>
+      this.analyzeToken(token).catch((e) => {
+        logger.error({ error: e.message, mint: token.mintKey }, 'Token analysis error');
+      }),
+    );
+    await Promise.all(tasks);
+  }
+
+  private async analyzeToken(token: TrackedToken): Promise<void> {
+    if (token.inFlight) return;
+
+    // Sample the pool — price + volume
+    const price = await this.priceFeed.samplePrice(
+      token.poolMatch.poolKeys,
+      this.config.quoteToken,
+      this.config.quoteAmountPerPosition,
+    );
+
+    if (price <= 0) {
+      logger.debug({ mint: token.mintKey }, 'Price sample returned 0, skipping');
+      return;
+    }
+
+    const volume = await this.priceFeed.sampleVolume(token.poolMatch.poolKeys, token.mintKey);
+    this.priceFeed.recordPrice(token.mintKey, price, volume);
+
+    const candles = this.priceFeed.getCandles(token.mintKey);
+    const holding = !!token.position;
+    const signal = generateSignal(candles, this.config.signalConfig, holding);
+
+    const label = token.info.symbol || token.mintKey.slice(0, 6);
+    logger.debug(
+      {
+        token: label,
+        price: price.toExponential(4),
+        candles: candles.length,
+        rsi: signal.indicators.rsi?.toFixed(1),
+        macdHist: signal.indicators.macdHistogram?.toExponential(2),
+        trend: signal.indicators.trend,
+        action: signal.action,
+        confidence: signal.confidence,
+      },
+      'analysis',
+    );
+
+    if (token.position) {
+      // Exit logic: combine risk-based and signal-based exits
+      const riskReason = token.position.evaluateRisk(price, this.config.riskConfig);
+      if (riskReason) {
+        logger.info({ token: label, reason: riskReason, pnl: token.position.pnlPercent(price).toFixed(2) + '%' }, 'Risk exit triggered');
+        token.inFlight = true;
+        try {
+          await this.sell(token, signal);
+        } finally {
+          token.inFlight = false;
+        }
+        return;
+      }
+
+      if (signal.action === 'SELL') {
+        logger.info(
+          { token: label, confidence: signal.confidence, reasons: signal.reasons, pnl: token.position.pnlPercent(price).toFixed(2) + '%' },
+          'Signal exit triggered',
+        );
+        token.inFlight = true;
+        try {
+          await this.sell(token, signal);
+        } finally {
+          token.inFlight = false;
+        }
+      }
+      return;
+    }
+
+    // Entry logic
+    if (signal.action !== 'BUY') return;
+
+    // Respect max concurrent positions
+    const activePositions = Array.from(this.tracked.values()).filter((t) => t.position).length;
+    if (activePositions >= this.config.maxConcurrentPositions) {
+      logger.debug({ active: activePositions }, 'Max concurrent positions reached, skipping buy');
+      return;
+    }
+
+    logger.info(
+      { token: label, confidence: signal.confidence, reasons: signal.reasons, price: price.toExponential(4) },
+      'Signal entry triggered',
+    );
+
+    token.inFlight = true;
+    try {
+      await this.buy(token, price, signal);
+    } finally {
+      token.inFlight = false;
+    }
+  }
+
+  private async buy(token: TrackedToken, price: number, signal: Signal): Promise<void> {
+    const poolKeys = token.poolMatch.poolKeys;
+    const tokenAta = await getAssociatedTokenAddress(poolKeys.baseMint, this.config.wallet.publicKey);
+
+    for (let attempt = 1; attempt <= this.config.maxBuyRetries; attempt++) {
+      try {
+        const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
+          {
+            poolKeys,
+            userKeys: {
+              tokenAccountIn: this.config.quoteAta,
+              tokenAccountOut: tokenAta,
+              owner: this.config.wallet.publicKey,
+            },
+            amountIn: this.config.quoteAmountPerPosition,
+            minAmountOut: new BN(0),
+          },
+          poolKeys.version,
+        );
+
+        const latestBlockhash = await this.connection.getLatestBlockhash({
+          commitment: this.connection.commitment,
+        });
+
+        const createAtaIx = createAssociatedTokenAccountIdempotentInstruction(
+          this.config.wallet.publicKey,
+          tokenAta,
+          this.config.wallet.publicKey,
+          poolKeys.baseMint,
+        );
+
+        const messageV0 = new TransactionMessage({
+          payerKey: this.config.wallet.publicKey,
+          recentBlockhash: latestBlockhash.blockhash,
+          instructions: [
+            ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.computeUnitLimit }),
+            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.computeUnitPrice }),
+            createAtaIx,
+            ...innerTransaction.instructions,
+          ],
+        }).compileToV0Message();
+
+        const transaction = new VersionedTransaction(messageV0);
+        transaction.sign([this.config.wallet, ...innerTransaction.signers]);
+
+        const result = await this.txExecutor.executeAndConfirm(transaction, latestBlockhash);
+
+        if (result.confirmed) {
+          // Read actual balance to record true token amount received
+          const accountInfo = await this.connection.getAccountInfo(tokenAta);
+          let tokenAmount = new BN(0);
+          if (accountInfo) {
+            const parsed = SPL_ACCOUNT_LAYOUT.decode(accountInfo.data);
+            tokenAmount = parsed.amount;
+          }
+
+          token.position = new Position({
+            mint: token.mint,
+            poolKeys,
+            tokenAta,
+            entryPrice: price,
+            entryQuoteAmount: this.config.quoteAmountPerPosition,
+            tokenAmount,
+          });
+
+          logger.info(
+            {
+              token: token.info.symbol || token.mintKey.slice(0, 6),
+              signature: result.signature,
+              entryPrice: price.toExponential(4),
+              dexscreener: `https://dexscreener.com/solana/${token.mintKey}`,
+            },
+            'Buy filled',
+          );
+          return;
+        }
+
+        logger.warn({ attempt, error: result.error }, 'Buy attempt failed');
+      } catch (e: any) {
+        logger.error({ error: e.message, attempt }, 'Buy error');
+      }
+    }
+
+    logger.error({ token: token.mintKey }, 'All buy attempts failed');
+  }
+
+  private async sell(token: TrackedToken, signal: Signal): Promise<void> {
+    if (!token.position) return;
+
+    const position = token.position;
+    const poolKeys = position.poolKeys;
+
+    // Refresh actual on-chain balance before selling
+    const accountInfo = await this.connection.getAccountInfo(position.tokenAta);
+    if (!accountInfo) {
+      logger.warn({ token: token.mintKey }, 'Token account missing, closing position');
+      token.position = undefined;
+      this.priceFeed.reset(token.mintKey);
+      return;
+    }
+    const parsed = SPL_ACCOUNT_LAYOUT.decode(accountInfo.data);
+    const sellAmount = parsed.amount;
+
+    if (sellAmount.isZero()) {
+      logger.info({ token: token.mintKey }, 'Token balance is zero, closing position');
+      token.position = undefined;
+      this.priceFeed.reset(token.mintKey);
+      return;
+    }
+
+    for (let attempt = 1; attempt <= this.config.maxSellRetries; attempt++) {
+      try {
+        const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
+          {
+            poolKeys,
+            userKeys: {
+              tokenAccountIn: position.tokenAta,
+              tokenAccountOut: this.config.quoteAta,
+              owner: this.config.wallet.publicKey,
+            },
+            amountIn: sellAmount,
+            minAmountOut: new BN(0),
+          },
+          poolKeys.version,
+        );
+
+        const latestBlockhash = await this.connection.getLatestBlockhash({
+          commitment: this.connection.commitment,
+        });
+
+        const messageV0 = new TransactionMessage({
+          payerKey: this.config.wallet.publicKey,
+          recentBlockhash: latestBlockhash.blockhash,
+          instructions: [
+            ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.computeUnitLimit }),
+            ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.computeUnitPrice }),
+            ...innerTransaction.instructions,
+          ],
+        }).compileToV0Message();
+
+        const transaction = new VersionedTransaction(messageV0);
+        transaction.sign([this.config.wallet, ...innerTransaction.signers]);
+
+        const result = await this.txExecutor.executeAndConfirm(transaction, latestBlockhash);
+
+        if (result.confirmed) {
+          logger.info(
+            {
+              token: token.info.symbol || token.mintKey.slice(0, 6),
+              signature: result.signature,
+              heldMs: position.ageMs,
+            },
+            'Sell filled',
+          );
+          token.position = undefined;
+          this.priceFeed.reset(token.mintKey);
+          return;
+        }
+
+        logger.warn({ attempt, error: result.error }, 'Sell attempt failed');
+      } catch (e: any) {
+        logger.error({ error: e.message, attempt }, 'Sell error');
+      }
+    }
+
+    logger.error({ token: token.mintKey }, 'All sell attempts failed');
+  }
+
+  getStatus(): Record<string, any> {
+    const status: Record<string, any> = {};
+    for (const [key, token] of this.tracked) {
+      const candles = this.priceFeed.getCandleCount(key);
+      status[token.info.symbol || key.slice(0, 6)] = {
+        mint: key,
+        candles,
+        position: token.position
+          ? {
+              entry: token.position.entryPrice,
+              peak: token.position.peak,
+              ageMs: token.position.ageMs,
+            }
+          : null,
+      };
+    }
+    return status;
+  }
+}
