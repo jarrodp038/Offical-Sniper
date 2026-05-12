@@ -5,6 +5,7 @@ import {
   ComputeBudgetProgram,
   TransactionMessage,
   VersionedTransaction,
+  SystemProgram,
 } from '@solana/web3.js';
 import {
   Liquidity,
@@ -17,6 +18,9 @@ import {
 import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountIdempotentInstruction,
+  createSyncNativeInstruction,
+  createCloseAccountInstruction,
+  NATIVE_MINT,
 } from '@solana/spl-token';
 import BN from 'bn.js';
 import { logger } from '../helpers/logger';
@@ -270,12 +274,31 @@ export class PatternTrader {
           poolKeys.baseMint,
         );
 
+        // Wrap native SOL -> WSOL before swap when using WSOL as quote
+        const wrapIxs = this.config.quoteMint.equals(NATIVE_MINT)
+          ? [
+              createAssociatedTokenAccountIdempotentInstruction(
+                this.config.wallet.publicKey,
+                this.config.quoteAta,
+                this.config.wallet.publicKey,
+                NATIVE_MINT,
+              ),
+              SystemProgram.transfer({
+                fromPubkey: this.config.wallet.publicKey,
+                toPubkey: this.config.quoteAta,
+                lamports: this.config.quoteAmountPerPosition.toNumber(),
+              }),
+              createSyncNativeInstruction(this.config.quoteAta),
+            ]
+          : [];
+
         const messageV0 = new TransactionMessage({
           payerKey: this.config.wallet.publicKey,
           recentBlockhash: latestBlockhash.blockhash,
           instructions: [
             ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.computeUnitLimit }),
             ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.computeUnitPrice }),
+            ...wrapIxs,
             createAtaIx,
             ...innerTransaction.instructions,
           ],
@@ -369,6 +392,17 @@ export class PatternTrader {
           commitment: this.connection.commitment,
         });
 
+        // Unwrap WSOL -> native SOL after sell when using WSOL as quote
+        const unwrapIxs = this.config.quoteMint.equals(NATIVE_MINT)
+          ? [
+              createCloseAccountInstruction(
+                this.config.quoteAta,
+                this.config.wallet.publicKey,
+                this.config.wallet.publicKey,
+              ),
+            ]
+          : [];
+
         const messageV0 = new TransactionMessage({
           payerKey: this.config.wallet.publicKey,
           recentBlockhash: latestBlockhash.blockhash,
@@ -376,6 +410,7 @@ export class PatternTrader {
             ComputeBudgetProgram.setComputeUnitLimit({ units: this.config.computeUnitLimit }),
             ComputeBudgetProgram.setComputeUnitPrice({ microLamports: this.config.computeUnitPrice }),
             ...innerTransaction.instructions,
+            ...unwrapIxs,
           ],
         }).compileToV0Message();
 
