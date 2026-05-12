@@ -173,7 +173,7 @@ export class PatternTrader {
     const signal = generateSignal(candles, this.config.signalConfig, holding);
 
     const label = token.info.symbol || token.mintKey.slice(0, 6);
-    logger.debug(
+    logger.info(
       {
         token: label,
         price: price.toExponential(4),
