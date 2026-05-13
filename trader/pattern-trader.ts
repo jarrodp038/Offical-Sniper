@@ -63,6 +63,7 @@ export class PatternTrader {
   private tracked: Map<string, TrackedToken> = new Map();
   private running: boolean = false;
   private analysisTimer: ReturnType<typeof setInterval> | undefined;
+  private cycleCount: number = 0;
 
   constructor(
     private readonly connection: Connection,
@@ -145,8 +146,10 @@ export class PatternTrader {
   }
 
   private async runCycle(): Promise<void> {
-    // Process all tracked tokens concurrently
-    const tasks = Array.from(this.tracked.values()).map((token) =>
+    const tokens = Array.from(this.tracked.values());
+    logger.info({ tokens: tokens.length, cycle: ++this.cycleCount }, 'Cycle start');
+
+    const tasks = tokens.map((token) =>
       this.analyzeToken(token).catch((e) => {
         logger.error({ error: e.message, mint: token.mintKey }, 'Token analysis error');
       }),
