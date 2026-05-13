@@ -27,6 +27,7 @@ import { logger } from '../helpers/logger';
 import { findPoolForToken, PoolMatch } from '../helpers/pool-finder';
 import { fetchTokenInfo, TokenInfo } from '../analysis/token-info';
 import { PriceFeed } from '../analysis/price-feed';
+import { backfillCandles } from '../analysis/history-loader';
 import { generateSignal, SignalConfig, DEFAULT_SIGNAL_CONFIG, Signal } from '../analysis/signal-engine';
 import { Position, PositionRiskConfig } from './position';
 import { TransactionExecutor } from '../transactions/transaction-executor.interface';
@@ -46,6 +47,7 @@ export interface PatternTraderConfig {
   maxSellRetries: number;
   buySlippage: number;
   sellSlippage: number;
+  backfillHours: number;
   signalConfig: SignalConfig;
   riskConfig: PositionRiskConfig;
 }
@@ -120,6 +122,16 @@ export class PatternTrader {
       throw new Error('No tradable tokens — all pool lookups failed.');
     }
 
+    if (this.config.backfillHours > 0) {
+      logger.info(
+        { hours: this.config.backfillHours, tokens: this.tracked.size },
+        'Backfilling historical candles from GeckoTerminal...',
+      );
+      await Promise.all(
+        Array.from(this.tracked.values()).map((t) => this.backfillToken(t)),
+      );
+    }
+
     logger.info(
       { count: this.tracked.size, interval: this.config.analysisIntervalMs },
       'Pattern trader ready — starting analysis loop',
@@ -134,6 +146,63 @@ export class PatternTrader {
 
     // Run once immediately
     void this.runCycle();
+  }
+
+  private async backfillToken(token: TrackedToken): Promise<void> {
+    const label = token.info.symbol || token.mintKey.slice(0, 6);
+    try {
+      const candles = await backfillCandles({
+        poolAddress: token.poolMatch.poolId.toBase58(),
+        symbol: label,
+        hours: this.config.backfillHours,
+      });
+
+      if (candles.length === 0) {
+        logger.warn(
+          { token: label, mint: token.mintKey },
+          'No historical candles available — will warm up from live data',
+        );
+        return;
+      }
+
+      this.priceFeed.seedHistory(token.mintKey, candles);
+
+      // Sample live price to normalize seeded history into the same units
+      // as on-chain pool simulation, so live data joins continuously.
+      const livePrice = await this.priceFeed.samplePrice(
+        token.poolMatch.poolKeys,
+        this.config.quoteToken,
+        this.config.quoteAmountPerPosition,
+      );
+      if (livePrice > 0) {
+        const ratio = this.priceFeed.normalizeHistoryTo(token.mintKey, livePrice);
+        if (ratio !== null && Math.abs(ratio - 1) >= 0.05) {
+          logger.info(
+            { token: label, ratio: ratio.toExponential(3) },
+            'Rescaled historical candles to match live pool price',
+          );
+        }
+      }
+
+      const first = candles[0];
+      const last = candles[candles.length - 1];
+      const spanHours = (last.timestamp - first.timestamp) / 3_600_000;
+      logger.info(
+        {
+          token: label,
+          candles: candles.length,
+          spanHours: spanHours.toFixed(1),
+          oldest: new Date(first.timestamp).toISOString(),
+          newest: new Date(last.timestamp).toISOString(),
+        },
+        'Chart history loaded',
+      );
+    } catch (e: any) {
+      logger.warn(
+        { token: label, error: e.message },
+        'Historical backfill failed — will warm up from live data',
+      );
+    }
   }
 
   async stop(): Promise<void> {

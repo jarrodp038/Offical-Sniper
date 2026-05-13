@@ -244,6 +244,7 @@ async function runPatternMode(args: CommonArgs): Promise<void> {
   const minConfidenceToBuy = getEnvNumber('MIN_CONFIDENCE_TO_BUY', 60);
   const minConfidenceToSell = getEnvNumber('MIN_CONFIDENCE_TO_SELL', 55);
   const minCandles = getEnvNumber('MIN_CANDLES', 30);
+  const backfillHours = getEnvNumber('BACKFILL_HOURS', 72);
 
   const takeProfitPercent = getEnvNumber('PATTERN_TAKE_PROFIT', 50);
   const stopLossPercent = getEnvNumber('PATTERN_STOP_LOSS', 25);
@@ -267,6 +268,7 @@ async function runPatternMode(args: CommonArgs): Promise<void> {
     maxSellRetries: args.maxSellRetries,
     buySlippage: args.buySlippage,
     sellSlippage: args.sellSlippage,
+    backfillHours,
     signalConfig: {
       ...DEFAULT_SIGNAL_CONFIG,
       rsiOversold,

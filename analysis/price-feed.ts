@@ -12,7 +12,7 @@ import { Candle } from './indicators';
 import { logger } from '../helpers/logger';
 
 const CANDLE_INTERVAL_MS = 60_000; // 1-minute candles
-const MAX_CANDLES = 500;
+const MAX_CANDLES = 10_000;
 
 interface PartialCandle {
   open: number;
@@ -167,6 +167,39 @@ export class PriceFeed {
 
   getCandleCount(mintKey: string): number {
     return (this.history.get(mintKey)?.length ?? 0) + (this.inProgress.has(mintKey) ? 1 : 0);
+  }
+
+  /**
+   * Seed completed-candle history from an external source (e.g. GeckoTerminal
+   * backfill). Replaces any existing stored history for the mint. The list
+   * should already be sorted oldest -> newest.
+   */
+  seedHistory(mintKey: string, candles: Candle[]): void {
+    if (candles.length === 0) return;
+    const trimmed = candles.length > MAX_CANDLES ? candles.slice(-MAX_CANDLES) : candles.slice();
+    this.history.set(mintKey, trimmed);
+  }
+
+  /**
+   * Rescale seeded history so its most recent close matches a live price
+   * sample. Indicators are largely scale-invariant but absolute-price
+   * indicators (Bollinger Bands, VWAP) and the continuity into live data
+   * benefit from a consistent unit. No-op when the scale already matches.
+   */
+  normalizeHistoryTo(mintKey: string, livePrice: number): number | null {
+    const history = this.history.get(mintKey);
+    if (!history || history.length === 0 || livePrice <= 0) return null;
+    const lastClose = history[history.length - 1].close;
+    if (lastClose <= 0) return null;
+    const ratio = livePrice / lastClose;
+    if (Math.abs(ratio - 1) < 0.05) return ratio;
+    for (const c of history) {
+      c.open *= ratio;
+      c.high *= ratio;
+      c.low *= ratio;
+      c.close *= ratio;
+    }
+    return ratio;
   }
 
   reset(mintKey: string): void {
