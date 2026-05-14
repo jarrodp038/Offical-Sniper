@@ -6,6 +6,8 @@ export interface MinimalMarketLayoutV3 {
   eventQueue: PublicKey;
   bids: PublicKey;
   asks: PublicKey;
+  baseVault: PublicKey;
+  quoteVault: PublicKey;
 }
 
 export async function getMinimalMarketV3(
@@ -27,6 +29,8 @@ export async function getMinimalMarketV3(
     eventQueue: decoded.eventQueue,
     bids: decoded.bids,
     asks: decoded.asks,
+    baseVault: decoded.baseVault,
+    quoteVault: decoded.quoteVault,
   };
 }
 
@@ -75,5 +79,7 @@ export async function fetchMarketAccounts(
     eventQueue: decoded.eventQueue,
     bids: decoded.bids,
     asks: decoded.asks,
+    baseVault: decoded.baseVault,
+    quoteVault: decoded.quoteVault,
   };
 }

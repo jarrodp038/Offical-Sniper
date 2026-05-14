@@ -67,6 +67,8 @@ export class Listener {
                     bids: decoded.bids,
                     asks: decoded.asks,
                     eventQueue: decoded.eventQueue,
+                    baseVault: decoded.baseVault,
+                    quoteVault: decoded.quoteVault,
                   });
                   logger.debug({ marketId }, 'Cached new market');
                 }

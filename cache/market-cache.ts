@@ -36,6 +36,8 @@ export class MarketCache {
         bids: decoded.bids,
         asks: decoded.asks,
         eventQueue: decoded.eventQueue,
+        baseVault: decoded.baseVault,
+        quoteVault: decoded.quoteVault,
       });
     }
 
