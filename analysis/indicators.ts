@@ -15,6 +15,7 @@ export interface IndicatorSnapshot {
   macdLine: number | null;
   macdSignal: number | null;
   macdHistogram: number | null;
+  macdHistPrev: number | null;
   vwap: number | null;
   bbUpper: number | null;
   bbMiddle: number | null;
@@ -22,6 +23,41 @@ export interface IndicatorSnapshot {
   atr: number | null;
   volumeRatio: number | null;
   trend: 'UP' | 'DOWN' | 'SIDEWAYS' | 'UNKNOWN';
+  trend5m: 'UP' | 'DOWN' | 'SIDEWAYS' | 'UNKNOWN';
+  trend15m: 'UP' | 'DOWN' | 'SIDEWAYS' | 'UNKNOWN';
+  trend1h: 'UP' | 'DOWN' | 'SIDEWAYS' | 'UNKNOWN';
+}
+
+export function aggregateCandles(candles: Candle[], periodMinutes: number): Candle[] {
+  if (candles.length === 0 || periodMinutes <= 1) return candles;
+
+  const periodMs = periodMinutes * 60_000;
+  const result: Candle[] = [];
+  let current: Candle | null = null;
+
+  for (const c of candles) {
+    const bucket = Math.floor(c.timestamp / periodMs) * periodMs;
+
+    if (!current || current.timestamp !== bucket) {
+      if (current) result.push(current);
+      current = {
+        open: c.open,
+        high: c.high,
+        low: c.low,
+        close: c.close,
+        volume: c.volume,
+        timestamp: bucket,
+      };
+    } else {
+      current.high = Math.max(current.high, c.high);
+      current.low = Math.min(current.low, c.low);
+      current.close = c.close;
+      current.volume += c.volume;
+    }
+  }
+
+  if (current) result.push(current);
+  return result;
 }
 
 export function calculateEMA(values: number[], period: number): number[] {
@@ -77,9 +113,9 @@ export function calculateMACD(
   fastPeriod: number = 12,
   slowPeriod: number = 26,
   signalPeriod: number = 9,
-): { macdLine: number | null; signal: number | null; histogram: number | null } {
+): { macdLine: number | null; signal: number | null; histogram: number | null; histogramPrev: number | null } {
   if (closes.length < slowPeriod + signalPeriod) {
-    return { macdLine: null, signal: null, histogram: null };
+    return { macdLine: null, signal: null, histogram: null, histogramPrev: null };
   }
 
   const emaFast = calculateEMA(closes, fastPeriod);
@@ -95,14 +131,19 @@ export function calculateMACD(
   const signalSeries = calculateEMA(macdSeries, signalPeriod);
 
   if (signalSeries.length === 0) {
-    return { macdLine: macdSeries[macdSeries.length - 1] ?? null, signal: null, histogram: null };
+    return { macdLine: macdSeries[macdSeries.length - 1] ?? null, signal: null, histogram: null, histogramPrev: null };
   }
 
   const macdLine = macdSeries[macdSeries.length - 1];
   const signal = signalSeries[signalSeries.length - 1];
   const histogram = macdLine - signal;
 
-  return { macdLine, signal, histogram };
+  let histogramPrev: number | null = null;
+  if (macdSeries.length >= 2 && signalSeries.length >= 2) {
+    histogramPrev = macdSeries[macdSeries.length - 2] - signalSeries[signalSeries.length - 2];
+  }
+
+  return { macdLine, signal, histogram, histogramPrev };
 }
 
 export function calculateBollingerBands(
@@ -139,7 +180,6 @@ export function calculateVWAP(candles: Candle[]): number | null {
   }
 
   if (vol === 0) {
-    // Fall back to simple average when volume is unavailable
     const avg = candles.reduce((sum, c) => sum + (c.high + c.low + c.close) / 3, 0) / candles.length;
     return avg;
   }
@@ -206,6 +246,14 @@ export function snapshotIndicators(candles: Candle[]): IndicatorSnapshot {
   const volumeRatio = calculateVolumeRatio(candles);
   const trend = detectTrend(candles);
 
+  const candles5m = aggregateCandles(candles, 5);
+  const candles15m = aggregateCandles(candles, 15);
+  const candles1h = aggregateCandles(candles, 60);
+
+  const trend5m = detectTrend(candles5m, 12);
+  const trend15m = detectTrend(candles15m, 8);
+  const trend1h = detectTrend(candles1h, 6);
+
   return {
     price,
     rsi,
@@ -214,6 +262,7 @@ export function snapshotIndicators(candles: Candle[]): IndicatorSnapshot {
     macdLine: macd.macdLine,
     macdSignal: macd.signal,
     macdHistogram: macd.histogram,
+    macdHistPrev: macd.histogramPrev,
     vwap,
     bbUpper: bb.upper,
     bbMiddle: bb.middle,
@@ -221,5 +270,8 @@ export function snapshotIndicators(candles: Candle[]): IndicatorSnapshot {
     atr,
     volumeRatio,
     trend,
+    trend5m,
+    trend15m,
+    trend1h,
   };
 }
