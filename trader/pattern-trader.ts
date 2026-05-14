@@ -122,6 +122,47 @@ export class PatternTrader {
       throw new Error('No tradable tokens — all pool lookups failed.');
     }
 
+    // Detect existing token holdings so the bot can manage sells for
+    // positions that were opened in a previous session (or manually).
+    for (const [mintKey, token] of this.tracked) {
+      try {
+        const tokenAta = await getAssociatedTokenAddress(token.mint, this.config.wallet.publicKey);
+        const accountInfo = await this.connection.getAccountInfo(tokenAta);
+        if (!accountInfo) continue;
+
+        const parsed = SPL_ACCOUNT_LAYOUT.decode(accountInfo.data);
+        if (parsed.amount.isZero()) continue;
+
+        const label = token.info.symbol || mintKey.slice(0, 6);
+        const price = await this.priceFeed.samplePrice(
+          token.poolMatch.poolKeys,
+          this.config.quoteToken,
+          this.config.quoteAmountPerPosition,
+          token.mint,
+        );
+
+        token.position = new Position({
+          mint: token.mint,
+          poolKeys: token.poolMatch.poolKeys,
+          tokenAta,
+          entryPrice: price > 0 ? price : 0,
+          entryQuoteAmount: this.config.quoteAmountPerPosition,
+          tokenAmount: parsed.amount,
+        });
+
+        logger.info(
+          {
+            token: label,
+            amount: parsed.amount.toString(),
+            currentPrice: price > 0 ? price.toExponential(4) : 'unknown',
+          },
+          'Existing position detected in wallet',
+        );
+      } catch (e: any) {
+        logger.warn({ mint: mintKey, error: e.message }, 'Failed to check existing balance');
+      }
+    }
+
     if (this.config.backfillHours > 0) {
       logger.info(
         { hours: this.config.backfillHours, tokens: this.tracked.size },
