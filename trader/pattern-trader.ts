@@ -173,6 +173,7 @@ export class PatternTrader {
         token.poolMatch.poolKeys,
         this.config.quoteToken,
         this.config.quoteAmountPerPosition,
+        token.mint,
       );
       if (livePrice > 0) {
         const ratio = this.priceFeed.normalizeHistoryTo(token.mintKey, livePrice);
@@ -234,6 +235,7 @@ export class PatternTrader {
       token.poolMatch.poolKeys,
       this.config.quoteToken,
       this.config.quoteAmountPerPosition,
+      token.mint,
     );
 
     if (price <= 0) {
@@ -241,7 +243,7 @@ export class PatternTrader {
       return;
     }
 
-    const volume = await this.priceFeed.sampleVolume(token.poolMatch.poolKeys, token.mintKey);
+    const volume = await this.priceFeed.sampleVolume(token.poolMatch.poolKeys, token.mintKey, token.mint);
     this.priceFeed.recordPrice(token.mintKey, price, volume);
 
     const candles = this.priceFeed.getCandles(token.mintKey);
@@ -317,7 +319,7 @@ export class PatternTrader {
 
   private async buy(token: TrackedToken, price: number, signal: Signal): Promise<void> {
     const poolKeys = token.poolMatch.poolKeys;
-    const tokenAta = await getAssociatedTokenAddress(poolKeys.baseMint, this.config.wallet.publicKey);
+    const tokenAta = await getAssociatedTokenAddress(token.mint, this.config.wallet.publicKey);
 
     for (let attempt = 1; attempt <= this.config.maxBuyRetries; attempt++) {
       try {
@@ -343,7 +345,7 @@ export class PatternTrader {
           this.config.wallet.publicKey,
           tokenAta,
           this.config.wallet.publicKey,
-          poolKeys.baseMint,
+          token.mint,
         );
 
         // Wrap native SOL -> WSOL before swap when using WSOL as quote

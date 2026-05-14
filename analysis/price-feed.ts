@@ -1,4 +1,4 @@
-import { Connection } from '@solana/web3.js';
+  import { Connection, PublicKey } from '@solana/web3.js';
 import {
   Liquidity,
   LiquidityPoolKeysV4,
@@ -38,6 +38,7 @@ export class PriceFeed {
     poolKeys: LiquidityPoolKeysV4,
     quoteToken: Token,
     sampleAmount: BN,
+    targetMint?: PublicKey,
   ): Promise<number> {
     try {
       const poolInfo = await Liquidity.fetchInfo({
@@ -45,38 +46,38 @@ export class PriceFeed {
         poolKeys,
       });
 
-      const baseToken = new Token(
-        TOKEN_PROGRAM_ID,
-        poolKeys.baseMint,
-        poolKeys.baseDecimals,
-      );
+      const reversed = targetMint ? poolKeys.quoteMint.equals(targetMint) : false;
+      const outMint = reversed ? poolKeys.quoteMint : poolKeys.baseMint;
+      const outDecimals = reversed ? poolKeys.quoteDecimals : poolKeys.baseDecimals;
+
+      const outToken = new Token(TOKEN_PROGRAM_ID, outMint, outDecimals);
 
       const amountOut = Liquidity.computeAmountOut({
         poolKeys,
         poolInfo,
         amountIn: new TokenAmount(quoteToken, sampleAmount),
-        currencyOut: baseToken,
+        currencyOut: outToken,
         slippage: new Percent(0, 100),
       });
 
-      const baseAmount = parseFloat(amountOut.amountOut.toFixed());
-      if (baseAmount === 0) return 0;
+      const targetAmount = parseFloat(amountOut.amountOut.toFixed());
+      if (targetAmount === 0) return 0;
 
       const quoteAmount = parseFloat(new TokenAmount(quoteToken, sampleAmount).toFixed());
-      return quoteAmount / baseAmount;
+      return quoteAmount / targetAmount;
     } catch (e: any) {
-      logger.warn({ error: e.message, mint: poolKeys.baseMint.toBase58() }, 'samplePrice failed');
+      logger.warn({ error: e.message, mint: (targetMint ?? poolKeys.baseMint).toBase58() }, 'samplePrice failed');
       return 0;
     }
   }
 
-  /**
-   * Estimate volume by tracking changes in the pool's quote vault balance.
-   * Each call returns the volume since the previous call.
-   */
-  async sampleVolume(poolKeys: LiquidityPoolKeysV4, mintKey: string): Promise<number> {
+  async sampleVolume(poolKeys: LiquidityPoolKeysV4, mintKey: string, targetMint?: PublicKey): Promise<number> {
     try {
-      const info = await this.connection.getAccountInfo(poolKeys.quoteVault);
+      const reversed = targetMint ? poolKeys.quoteMint.equals(targetMint) : false;
+      const vault = reversed ? poolKeys.baseVault : poolKeys.quoteVault;
+      const decimals = reversed ? poolKeys.baseDecimals : poolKeys.quoteDecimals;
+
+      const info = await this.connection.getAccountInfo(vault);
       if (!info) return 0;
       const balance = info.data.readBigUInt64LE(64);
 
@@ -86,7 +87,7 @@ export class PriceFeed {
       if (prev === undefined) return 0;
 
       const delta = balance > prev ? balance - prev : prev - balance;
-      const scale = 10 ** poolKeys.quoteDecimals;
+      const scale = 10 ** decimals;
       return Number(delta) / scale;
     } catch {
       return 0;
