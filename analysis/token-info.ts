@@ -1,5 +1,5 @@
 import { Connection, PublicKey } from '@solana/web3.js';
-import { getMint } from '@solana/spl-token';
+import { getMint, TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from '@solana/spl-token';
 import { logger } from '../helpers/logger';
 
 const METAPLEX_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
@@ -15,12 +15,24 @@ export interface TokenInfo {
   freezeAuthorityRenounced: boolean;
   topHolderPercent: number | null;
   holderCount: number | null;
+  tokenProgramId: PublicKey;
 }
 
 export async function fetchTokenInfo(
   connection: Connection,
   mint: PublicKey,
 ): Promise<TokenInfo> {
+  // Detect token program by checking mint account owner
+  let tokenProgramId: PublicKey = TOKEN_PROGRAM_ID;
+  try {
+    const mintAccountInfo = await connection.getAccountInfo(mint);
+    if (mintAccountInfo && mintAccountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+      tokenProgramId = TOKEN_2022_PROGRAM_ID;
+    }
+  } catch (e: any) {
+    logger.debug({ error: e.message }, 'Failed to detect token program');
+  }
+
   const info: TokenInfo = {
     mint: mint.toBase58(),
     decimals: 0,
@@ -29,11 +41,12 @@ export async function fetchTokenInfo(
     freezeAuthorityRenounced: false,
     topHolderPercent: null,
     holderCount: null,
+    tokenProgramId,
   };
 
   // Mint account data
   try {
-    const mintInfo = await getMint(connection, mint);
+    const mintInfo = await getMint(connection, mint, undefined, tokenProgramId);
     info.decimals = mintInfo.decimals;
     info.supply = mintInfo.supply.toString();
     info.mintAuthorityRenounced = mintInfo.mintAuthority === null;

@@ -24,6 +24,7 @@ import {
   createSyncNativeInstruction,
   createCloseAccountInstruction,
   NATIVE_MINT,
+  TOKEN_2022_PROGRAM_ID,
 } from '@solana/spl-token';
 import * as fs from 'fs';
 import { logger } from './helpers/logger';
@@ -65,6 +66,7 @@ interface Position {
   poolKeys: LiquidityPoolKeysV4;
   mint: PublicKey;
   timestamp: number;
+  tokenProgramId: PublicKey;
 }
 
 export class Bot {
@@ -200,15 +202,29 @@ export class Bot {
     return false;
   }
 
+  private async detectTokenProgram(mint: PublicKey): Promise<PublicKey> {
+    try {
+      const info = await this.connection.getAccountInfo(mint);
+      if (info && info.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+        return TOKEN_2022_PROGRAM_ID;
+      }
+    } catch {}
+    return TOKEN_PROGRAM_ID;
+  }
+
   private async buy(poolKeys: LiquidityPoolKeysV4, poolState: LiquidityStateV4): Promise<void> {
     const baseMint = poolKeys.baseMint.toBase58();
     logger.info({ mint: baseMint }, 'Attempting to buy...');
+
+    const tokenProgramId = await this.detectTokenProgram(poolKeys.baseMint);
 
     for (let attempt = 1; attempt <= this.config.maxBuyRetries; attempt++) {
       try {
         const tokenAta = await getAssociatedTokenAddress(
           poolKeys.baseMint,
           this.config.wallet.publicKey,
+          false,
+          tokenProgramId,
         );
 
         const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
@@ -220,10 +236,19 @@ export class Bot {
               owner: this.config.wallet.publicKey,
             },
             amountIn: this.config.quoteAmount.raw,
-            minAmountOut: new BN(0), // Slippage handled by amount calc
+            minAmountOut: new BN(0),
           },
           poolKeys.version,
         );
+
+        // SDK hardcodes TOKEN_PROGRAM_ID at account [0] — patch it for Token-2022
+        if (tokenProgramId.equals(TOKEN_2022_PROGRAM_ID)) {
+          for (const ix of innerTransaction.instructions) {
+            if (ix.programId.equals(poolKeys.programId) && ix.keys.length > 0) {
+              ix.keys[0] = { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false };
+            }
+          }
+        }
 
         const latestBlockhash = await this.connection.getLatestBlockhash({
           commitment: this.connection.commitment,
@@ -234,6 +259,7 @@ export class Bot {
           tokenAta,
           this.config.wallet.publicKey,
           poolKeys.baseMint,
+          tokenProgramId,
         );
 
         // Wrap native SOL -> WSOL before swap when using WSOL as quote
@@ -285,6 +311,7 @@ export class Bot {
             poolKeys,
             mint: poolKeys.baseMint,
             timestamp: Date.now(),
+            tokenProgramId,
           });
 
           if (this.config.autoSell) {
@@ -451,10 +478,12 @@ export class Bot {
     poolKeys: LiquidityPoolKeysV4,
     tokenAta: PublicKey,
     amount: BN,
+    tokenProgramId?: PublicKey,
   ): Promise<void> {
     const baseMint = poolKeys.baseMint.toBase58();
     logger.info({ mint: baseMint, amount: amount.toString() }, 'Attempting to sell...');
 
+    const resolvedTokenProgram = tokenProgramId || await this.detectTokenProgram(poolKeys.baseMint);
     const baseToken = new Token(TOKEN_PROGRAM_ID, poolKeys.baseMint, poolKeys.baseDecimals);
 
     for (let attempt = 1; attempt <= this.config.maxSellRetries; attempt++) {
@@ -468,10 +497,19 @@ export class Bot {
               owner: this.config.wallet.publicKey,
             },
             amountIn: amount,
-            minAmountOut: new BN(0), // Slippage handled
+            minAmountOut: new BN(0),
           },
           poolKeys.version,
         );
+
+        // SDK hardcodes TOKEN_PROGRAM_ID at account [0] — patch it for Token-2022
+        if (resolvedTokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
+          for (const ix of innerTransaction.instructions) {
+            if (ix.programId.equals(poolKeys.programId) && ix.keys.length > 0) {
+              ix.keys[0] = { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false };
+            }
+          }
+        }
 
         const latestBlockhash = await this.connection.getLatestBlockhash({
           commitment: this.connection.commitment,

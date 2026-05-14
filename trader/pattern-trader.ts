@@ -21,6 +21,7 @@ import {
   createSyncNativeInstruction,
   createCloseAccountInstruction,
   NATIVE_MINT,
+  TOKEN_2022_PROGRAM_ID,
 } from '@solana/spl-token';
 import BN from 'bn.js';
 import { logger } from '../helpers/logger';
@@ -96,6 +97,7 @@ export class PatternTrader {
 
       const info = await fetchTokenInfo(this.connection, mint);
 
+      const isToken2022 = info.tokenProgramId.equals(TOKEN_2022_PROGRAM_ID);
       logger.info(
         {
           mint: mintKey,
@@ -105,6 +107,7 @@ export class PatternTrader {
           renounced: info.mintAuthorityRenounced,
           freezable: !info.freezeAuthorityRenounced,
           topHolderPct: info.topHolderPercent,
+          tokenProgram: isToken2022 ? 'Token-2022' : 'SPL Token',
         },
         'Token loaded',
       );
@@ -126,7 +129,10 @@ export class PatternTrader {
     // positions that were opened in a previous session (or manually).
     for (const [mintKey, token] of this.tracked) {
       try {
-        const tokenAta = await getAssociatedTokenAddress(token.mint, this.config.wallet.publicKey);
+        const tokenProgram = token.info.tokenProgramId;
+        const tokenAta = await getAssociatedTokenAddress(
+          token.mint, this.config.wallet.publicKey, false, tokenProgram,
+        );
         const accountInfo = await this.connection.getAccountInfo(tokenAta);
         if (!accountInfo) continue;
 
@@ -364,7 +370,10 @@ export class PatternTrader {
 
   private async buy(token: TrackedToken, price: number, signal: Signal): Promise<void> {
     const poolKeys = token.poolMatch.poolKeys;
-    const tokenAta = await getAssociatedTokenAddress(token.mint, this.config.wallet.publicKey);
+    const tokenProgram = token.info.tokenProgramId;
+    const tokenAta = await getAssociatedTokenAddress(
+      token.mint, this.config.wallet.publicKey, false, tokenProgram,
+    );
 
     for (let attempt = 1; attempt <= this.config.maxBuyRetries; attempt++) {
       try {
@@ -382,6 +391,15 @@ export class PatternTrader {
           poolKeys.version,
         );
 
+        // SDK hardcodes TOKEN_PROGRAM_ID at account [0] — patch it for Token-2022
+        if (tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
+          for (const ix of innerTransaction.instructions) {
+            if (ix.programId.equals(poolKeys.programId) && ix.keys.length > 0) {
+              ix.keys[0] = { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false };
+            }
+          }
+        }
+
         const latestBlockhash = await this.connection.getLatestBlockhash({
           commitment: this.connection.commitment,
         });
@@ -391,6 +409,7 @@ export class PatternTrader {
           tokenAta,
           this.config.wallet.publicKey,
           token.mint,
+          tokenProgram,
         );
 
         // Wrap native SOL -> WSOL before swap when using WSOL as quote
@@ -491,6 +510,8 @@ export class PatternTrader {
       return;
     }
 
+    const tokenProgram = token.info.tokenProgramId;
+
     for (let attempt = 1; attempt <= this.config.maxSellRetries; attempt++) {
       try {
         const { innerTransaction } = Liquidity.makeSwapFixedInInstruction(
@@ -506,6 +527,15 @@ export class PatternTrader {
           },
           poolKeys.version,
         );
+
+        // SDK hardcodes TOKEN_PROGRAM_ID at account [0] — patch it for Token-2022
+        if (tokenProgram.equals(TOKEN_2022_PROGRAM_ID)) {
+          for (const ix of innerTransaction.instructions) {
+            if (ix.programId.equals(poolKeys.programId) && ix.keys.length > 0) {
+              ix.keys[0] = { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false };
+            }
+          }
+        }
 
         const latestBlockhash = await this.connection.getLatestBlockhash({
           commitment: this.connection.commitment,
